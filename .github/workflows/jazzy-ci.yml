@@ -1,0 +1,80 @@
+name: Jazzy build & test
+
+on:
+  push:
+    branches: ['ci/**']
+  workflow_dispatch:
+
+jobs:
+  build_and_test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    container: ros:jazzy
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: pr-change
+            repository: ''
+            ref: ''
+          - name: baseline-upstream-jazzy
+            repository: ros2/rmw_connextdds
+            ref: jazzy
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      RTI_NC_LICENSE_ACCEPTED: 'yes'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repository || github.repository }}
+          ref: ${{ matrix.ref || github.sha }}
+          path: ws/src/rmw_connextdds
+
+      - name: Show code under test
+        working-directory: ws/src/rmw_connextdds
+        run: |
+          git log --oneline -3
+          grep -n -B1 "Failed to parse type hash" rmw_connextdds_common/src/common/rmw_graph.cpp
+
+      - name: Install dependencies (incl. RTI Connext 6.0.1)
+        working-directory: ws
+        run: |
+          apt-get update -qq
+          echo "rti-connext-dds-6.0.1 rti-connext-dds-6.0.1/license/accepted select true" | debconf-set-selections
+          rosdep update --rosdistro jazzy
+          rosdep install -y --from-paths src --ignore-src --rosdistro jazzy
+          CONNEXTDDS_DIR=$(ls -d /opt/rti.com/rti_connext_dds-6.0.1)
+          test -d "$CONNEXTDDS_DIR/lib"
+          echo "CONNEXTDDS_DIR=$CONNEXTDDS_DIR" >> "$GITHUB_ENV"
+
+      - name: Build
+        working-directory: ws
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          colcon build --event-handlers console_cohesion+ \
+            --cmake-args -DBUILD_TESTING=ON 2>&1 | tee build.log
+          # Fail loudly if the RMW was skipped because Connext wasn't found
+          ! grep -q "Skipping rmw_connextdds" build.log
+          test -f install/rmw_connextdds/lib/librmw_connextdds.so
+          echo "--- warnings from rmw_graph.cpp (if any):"
+          grep -n "rmw_graph.cpp.*warning" build.log || echo "none"
+
+      - name: Test
+        working-directory: ws
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          colcon test --event-handlers console_cohesion+ || true
+          colcon test-result --verbose
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.name }}
+          path: |
+            ws/build.log
+            ws/log
+            ws/build/*/test_results
